@@ -1,0 +1,40 @@
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isParticipant(matchId) {
+      return exists(/databases/$(database)/documents/matches/$(matchId)) &&
+             (get(/databases/$(database)/documents/matches/$(matchId)).data.userA == request.auth.uid ||
+              get(/databases/$(database)/documents/matches/$(matchId)).data.userB == request.auth.uid);
+    }
+
+    // Users can read/write their own user doc
+    match /users/{uid} {
+      allow read: if isSignedIn() && request.auth.uid == uid;
+      allow write: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    // Queue: each user may create/update/delete only their own queue doc
+    match /queue/{uid} {
+      allow read: if false; // no public reads
+      allow write: if isSignedIn() && request.auth.uid == uid;
+      allow delete: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    // Matches metadata
+    match /matches/{matchId} {
+      allow read, write: if isSignedIn() && isParticipant(matchId);
+
+      // Messages under a match
+      match /messages/{msgId} {
+        allow read, create: if isSignedIn() && isParticipant(matchId);
+        allow delete, update: if false;
+      }
+    }
+  }
+}

@@ -1,70 +1,81 @@
-import { db } from './firebase';
+// lib/match.ts
 import {
-  doc, setDoc, deleteDoc, serverTimestamp, collection, query, getDocs, runTransaction
+  getFirestore, doc, setDoc, serverTimestamp, runTransaction, collection
 } from 'firebase/firestore';
 
-export type Prefs = {
-  gender?: 'male' | 'female' | 'other';
-  want?: 'any' | 'male' | 'female' | 'other';
-};
+export type Prefs = { want: 'any' | 'male' | 'female' | 'other' };
 
-// Enter queue and try to pair optimistically without Cloud Functions (best-effort demo)
+function matchIdFor(a: string, b: string) {
+  return [a, b].sort().join('_');
+}
+
+/** Pair using a single ticket doc; write sessions for BOTH users. */
 export async function enterQueueAndPair(uid: string, prefs: Prefs) {
-  const myRef = doc(db, 'queue', uid);
-  await setDoc(myRef, { uid, ...prefs, createdAt: serverTimestamp() });
+  const db = getFirestore();
 
-  // Try to find a partner: naive scan. For production, move to Cloud Functions with indexed queries.
-  const q = query(collection(db, 'queue'));
-  const candidates = await getDocs(q);
+  // best-effort: record I’m searching (optional)
+  await setDoc(doc(db, 'queue', uid), {
+    uid,
+    want: prefs?.want ?? 'any',
+    enqueuedAt: Date.now(),
+  }, { merge: true });
 
-  let partner: any = null;
-  candidates.forEach((snap) => {
-    const d = snap.data();
-    if (d.uid !== uid) {
-      const ok = compatible(prefs, d);
-      if (ok && !partner) partner = d;
+  const res = await runTransaction(db, async (tx) => {
+    const ticketRef = doc(db, 'tickets', 'open');
+    const tSnap = await tx.get(ticketRef);
+
+    if (!tSnap.exists() || !tSnap.data()?.holder) {
+      // No holder -> become the holder
+      tx.set(ticketRef, { holder: uid, want: prefs?.want ?? 'any', at: Date.now() });
+      // also clear my session
+      tx.set(doc(db, 'sessions', uid), { matchId: null, status: 'waiting', updatedAt: Date.now() });
+      return { status: 'waiting' as const };
     }
-  });
 
-  if (!partner) return { status: 'waiting' as const };
+    const holder = tSnap.data().holder as string;
+    if (holder === uid) {
+      // I’m already the holder -> still waiting
+      tx.set(doc(db, 'sessions', uid), { matchId: null, status: 'waiting', updatedAt: Date.now() }, { merge: true });
+      return { status: 'waiting' as const };
+    }
 
-  // Create match with a transaction so only one side succeeds
-  const a = uid;
-  const b = partner.uid as string;
-  const matchId = [a, b].sort().join('_');
-  const matchRef = doc(db, 'matches', matchId);
+    // Pair holder <-> me
+    const id = matchIdFor(holder, uid);
+    const matchRef = doc(db, 'matches', id);
 
-  await runTransaction(db, async (tx) => {
-    const matchSnap = await tx.get(matchRef);
-    if (matchSnap.exists()) return;
-
-    // delete both from queue
-    tx.delete(doc(db, 'queue', a));
-    tx.delete(doc(db, 'queue', b));
-
-    // create match
     tx.set(matchRef, {
-      userA: a,
-      userB: b,
-      createdAt: Date.now(),
-      active: true
+      id,
+      userA: holder,
+      userB: uid,
+      startedAt: serverTimestamp(),
     });
+
+    // Seed a system message so both immediately see something
+    const firstMsgRef = doc(collection(db, 'matches', id, 'messages'));
+    tx.set(firstMsgRef, {
+      from: 'system',
+      text: 'You are now connected. Say hi 👋',
+      createdAt: Date.now(),
+      ts: serverTimestamp(),
+    });
+
+    // Set sessions for BOTH users
+    tx.set(doc(db, 'sessions', holder), { matchId: id, status: 'matched', updatedAt: Date.now() });
+    tx.set(doc(db, 'sessions', uid),    { matchId: id, status: 'matched', updatedAt: Date.now() });
+
+    // release ticket
+    tx.delete(ticketRef);
+
+    return { status: 'matched' as const, matchId: id };
   });
 
-  return { status: 'matched' as const, matchId };
+  return res;
 }
 
 export async function leaveQueue(uid: string) {
-  await deleteDoc(doc(db, 'queue', uid));
-}
-
-function compatible(a: Prefs, b: Prefs) {
-  const wantsA = a.want ?? 'any';
-  const wantsB = b.want ?? 'any';
-  const genderA = a.gender ?? 'other';
-  const genderB = b.gender ?? 'other';
-
-  const aOk = (wantsA === 'any') || (wantsA === genderB);
-  const bOk = (wantsB === 'any') || (wantsB === genderA);
-  return aOk && bOk;
+  const db = getFirestore();
+  // Release ticket if I hold it
+  await setDoc(doc(db, 'tickets', 'open'), { holder: null }, { merge: true });
+  // Clear my session
+  await setDoc(doc(db, 'sessions', uid), { matchId: null, status: 'idle', updatedAt: Date.now() }, { merge: true });
 }
